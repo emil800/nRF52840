@@ -1,0 +1,6 @@
+{
+  "clangd.arguments": [
+    "--compile-commands-dir=build/nRF52840"
+  ],
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/build/nRF52840/compile_commands.json"
+}

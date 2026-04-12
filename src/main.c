@@ -10,6 +10,32 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
+#include <hal/nrf_i2s.h>
+
+/*
+ * After a soft reset, peripheral PSEL registers can persist. The board's
+ * default SPI2 uses the same pins as our I2S output, so disconnect both
+ * before driver init to leave the pin mux in a clean state.
+ */
+static int peripheral_force_reset(void)
+{
+	nrf_i2s_task_trigger(NRF_I2S0, NRF_I2S_TASK_STOP);
+	nrf_i2s_disable(NRF_I2S0);
+
+	NRF_SPIM2->ENABLE = 0;
+	NRF_SPIM2->PSEL.SCK = 0xFFFFFFFFUL;
+	NRF_SPIM2->PSEL.MOSI = 0xFFFFFFFFUL;
+	NRF_SPIM2->PSEL.MISO = 0xFFFFFFFFUL;
+
+	NRF_SPI2->ENABLE = 0;
+	NRF_SPI2->PSEL.SCK = 0xFFFFFFFFUL;
+	NRF_SPI2->PSEL.MOSI = 0xFFFFFFFFUL;
+	NRF_SPI2->PSEL.MISO = 0xFFFFFFFFUL;
+
+	return 0;
+}
+
+SYS_INIT(peripheral_force_reset, PRE_KERNEL_1, 0);
 
 /* --- LED Matrix Configuration --- */
 #define STRIP_NODE DT_ALIAS(led_strip)
@@ -17,16 +43,20 @@
 #define HEIGHT 16
 #define NUM_PIXELS (WIDTH * HEIGHT)
 
-#define SLEEP_MS_ACTIVE 100
+#define SLEEP_MS_ACTIVE 220
+#define FWD_R 32
+#define FWD_G 32
+#define FWD_B 32
+#define AMBER_R 64
+#define AMBER_G 32
+#define AMBER_B 0
 
 enum bike_state { STATE_FORWARD = 0, STATE_LEFT = 1, STATE_RIGHT = 2 };
 
-/* After POR: no BLE link, LEDs off until connected and a 1/2/3 command enables them. */
 static volatile bool ble_connected;
 static volatile bool leds_active;
 static volatile enum bike_state current_mode = STATE_FORWARD;
 
-/* Wakes main loop on state changes; limit > 1 avoids missed gives before take. */
 static K_SEM_DEFINE(wake_sem, 0, 16);
 
 static const struct device *const strip = DEVICE_DT_GET(STRIP_NODE);
@@ -34,18 +64,12 @@ static struct led_rgb pixels[NUM_PIXELS];
 
 /* --- Bluetooth Service Logic --- */
 
-// Custom Service UUID: 12345678-1234-5678-1234-567812345678
 static struct bt_uuid_128 bike_svc_uuid = BT_UUID_INIT_128(
 	BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x567812345678));
 
-// Characteristic UUID: 12345678-1234-5678-1234-567812345679
 static struct bt_uuid_128 bike_char_uuid = BT_UUID_INIT_128(
 	BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x567812345679));
 
-/*
- * GATT write: 0 = LEDs off + low-power cadence; 1/2/3 = show forward / left / right
- * (only meaningful while connected; disconnect also forces LEDs off).
- */
 static ssize_t write_bike_mode(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			       const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
@@ -84,7 +108,16 @@ static ssize_t write_bike_mode(struct bt_conn *conn, const struct bt_gatt_attr *
 	return len;
 }
 
-/* Advertising payloads (used by main and by adv-restart work). */
+static void on_connected(struct bt_conn *conn, uint8_t err)
+{
+	ARG_UNUSED(conn);
+
+	if (err == 0) {
+		ble_connected = true;
+		k_sem_give(&wake_sem);
+	}
+}
+
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL,
@@ -96,28 +129,22 @@ static const struct bt_data sd[] = {
 		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
+static void restart_adv_work_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(restart_adv_work, restart_adv_work_handler);
+
 static void restart_adv_work_handler(struct k_work *work)
 {
 	int err;
 
 	ARG_UNUSED(work);
 
+	(void)bt_le_adv_stop();
 	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-	if (err != 0 && err != -EALREADY) {
-		/* Advertising restart failed; link layer may retry on next disconnect. */
+	if (err == 0 || err == -EALREADY) {
+		return;
 	}
-}
 
-static K_WORK_DEFINE(restart_adv_work, restart_adv_work_handler);
-
-static void on_connected(struct bt_conn *conn, uint8_t err)
-{
-	ARG_UNUSED(conn);
-
-	if (err == 0) {
-		ble_connected = true;
-		k_sem_give(&wake_sem);
-	}
+	(void)k_work_schedule(&restart_adv_work, K_MSEC(250));
 }
 
 static void on_disconnected(struct bt_conn *conn, uint8_t reason)
@@ -128,11 +155,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 	ble_connected = false;
 	leds_active = false;
 	k_sem_give(&wake_sem);
-	/*
-	 * Legacy connectable advertising stops when a link is formed; restart
-	 * from the system workqueue so a new central can connect after drop.
-	 */
-	k_work_submit(&restart_adv_work);
+	(void)k_work_schedule(&restart_adv_work, K_MSEC(150));
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
@@ -140,7 +163,6 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.disconnected = on_disconnected,
 };
 
-// Define the Bluetooth Service
 BT_GATT_SERVICE_DEFINE(bike_svc,
 	BT_GATT_PRIMARY_SERVICE(&bike_svc_uuid),
 	BT_GATT_CHARACTERISTIC(&bike_char_uuid.uuid,
@@ -153,7 +175,6 @@ BT_GATT_SERVICE_DEFINE(bike_svc,
 
 static uint32_t get_idx(int x, int y)
 {
-	/* Zig-zag wiring common in 16x16 matrices */
 	if (y % 2 != 0) {
 		return (uint32_t)((y * WIDTH) + (WIDTH - 1 - x));
 	}
@@ -190,7 +211,6 @@ static int wrap_x(int x)
 	return x;
 }
 
-/* Up arrow (↑), same geometry as forward: tip + flare + shaft (mirrors blit_left/right layout). */
 static void blit_up_arrow(int origin_y, uint8_t r, uint8_t g, uint8_t b)
 {
 	const int tip = origin_y;
@@ -209,10 +229,6 @@ static void blit_up_arrow(int origin_y, uint8_t r, uint8_t g, uint8_t b)
 	}
 }
 
-/*
- * Left arrow (←): same proportions as up arrow, rotated — tip is the left column,
- * then wider columns, then an 8-column horizontal shaft on rows 7–8.
- */
 static void blit_left_arrow(int origin_x, uint8_t r, uint8_t g, uint8_t b)
 {
 	const int tip = origin_x;
@@ -231,7 +247,6 @@ static void blit_left_arrow(int origin_x, uint8_t r, uint8_t g, uint8_t b)
 	}
 }
 
-/* Right arrow (→): mirror of left; tip is the right column of the head. */
 static void blit_right_arrow(int origin_x, uint8_t r, uint8_t g, uint8_t b)
 {
 	const int tip = origin_x;
@@ -253,55 +268,53 @@ static void blit_right_arrow(int origin_x, uint8_t r, uint8_t g, uint8_t b)
 void draw_forward(uint32_t frame)
 {
 	memset(pixels, 0, sizeof(pixels));
-	/* Scroll tip upward (negative origin moves pattern up the display) */
 	int origin_y = -(int)(frame % HEIGHT);
 
-	blit_up_arrow(origin_y, 2, 2, 2);
+	blit_up_arrow(origin_y, FWD_R, FWD_G, FWD_B);
 }
 
 void draw_left(uint32_t frame)
 {
 	memset(pixels, 0, sizeof(pixels));
-	/* Same scroll feel as forward, horizontal; amber */
 	int origin_x = -(int)(frame % WIDTH);
 
-	blit_left_arrow(origin_x, 16, 8, 0);
+	blit_left_arrow(origin_x, AMBER_R, AMBER_G, AMBER_B);
 }
 
 void draw_right(uint32_t frame)
 {
 	memset(pixels, 0, sizeof(pixels));
-	/* Shaft leads left from tip; scroll right with +frame */
 	int origin_x = (int)(frame % WIDTH);
 
-	blit_right_arrow(origin_x, 16, 8, 0);
+	blit_right_arrow(origin_x, AMBER_R, AMBER_G, AMBER_B);
 }
 
 /* --- Main Loop --- */
 
-int main(void) {
+int main(void)
+{
 	int err;
 	uint32_t frame = 0;
 
-	if (!device_is_ready(strip)) return -1;
+	if (!device_is_ready(strip)) {
+		return -1;
+	}
 
-	// Initialize Bluetooth
 	err = bt_enable(NULL);
-	if (err) return -1;
+	if (err) {
+		return -1;
+	}
 
-	// Start Advertising
-	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-	if (err) return -1;
-
-	/* Clear LEDs once at startup */
-	memset(pixels, 0, sizeof(pixels));
-	led_strip_update_rgb(strip, pixels, NUM_PIXELS);
+	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
+			      sd, ARRAY_SIZE(sd));
+	if (err) {
+		return -1;
+	}
 
 	while (1) {
 		if (!(ble_connected && leds_active)) {
-			/* Low-power: LEDs off, block until a BLE event wakes us. */
 			memset(pixels, 0, sizeof(pixels));
-			led_strip_update_rgb(strip, pixels, NUM_PIXELS);
+			(void)led_strip_update_rgb(strip, pixels, NUM_PIXELS);
 			frame = 0;
 			k_sem_take(&wake_sem, K_FOREVER);
 			continue;
@@ -319,7 +332,7 @@ int main(void) {
 			break;
 		}
 
-		led_strip_update_rgb(strip, pixels, NUM_PIXELS);
+		(void)led_strip_update_rgb(strip, pixels, NUM_PIXELS);
 		frame++;
 		k_msleep(SLEEP_MS_ACTIVE);
 	}
