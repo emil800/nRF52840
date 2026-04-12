@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdbool.h>
 #include <string.h>
 #include <zephyr/kernel.h>
@@ -17,7 +18,6 @@
 #define NUM_PIXELS (WIDTH * HEIGHT)
 
 #define SLEEP_MS_ACTIVE 100
-#define SLEEP_MS_LOWPOWER 5000
 
 enum bike_state { STATE_FORWARD = 0, STATE_LEFT = 1, STATE_RIGHT = 2 };
 
@@ -26,8 +26,8 @@ static volatile bool ble_connected;
 static volatile bool leds_active;
 static volatile enum bike_state current_mode = STATE_FORWARD;
 
-/* Wakes main loop immediately on state changes (connect, disconnect, command). */
-static K_SEM_DEFINE(wake_sem, 0, 1);
+/* Wakes main loop on state changes; limit > 1 avoids missed gives before take. */
+static K_SEM_DEFINE(wake_sem, 0, 16);
 
 static const struct device *const strip = DEVICE_DT_GET(STRIP_NODE);
 static struct led_rgb pixels[NUM_PIXELS];
@@ -84,6 +84,32 @@ static ssize_t write_bike_mode(struct bt_conn *conn, const struct bt_gatt_attr *
 	return len;
 }
 
+/* Advertising payloads (used by main and by adv-restart work). */
+static const struct bt_data ad[] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL,
+		      BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x567812345678)),
+};
+
+static const struct bt_data sd[] = {
+	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
+		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+};
+
+static void restart_adv_work_handler(struct k_work *work)
+{
+	int err;
+
+	ARG_UNUSED(work);
+
+	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+	if (err != 0 && err != -EALREADY) {
+		/* Advertising restart failed; link layer may retry on next disconnect. */
+	}
+}
+
+static K_WORK_DEFINE(restart_adv_work, restart_adv_work_handler);
+
 static void on_connected(struct bt_conn *conn, uint8_t err)
 {
 	ARG_UNUSED(conn);
@@ -102,6 +128,11 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 	ble_connected = false;
 	leds_active = false;
 	k_sem_give(&wake_sem);
+	/*
+	 * Legacy connectable advertising stops when a link is formed; restart
+	 * from the system workqueue so a new central can connect after drop.
+	 */
+	k_work_submit(&restart_adv_work);
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
@@ -117,18 +148,6 @@ BT_GATT_SERVICE_DEFINE(bike_svc,
 			       BT_GATT_PERM_WRITE,
 			       NULL, write_bike_mode, NULL),
 );
-
-// Bluetooth Advertising Data
-static const struct bt_data ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL,
-		      BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x567812345678)),
-};
-
-static const struct bt_data sd[] = {
-	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
-		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
-};
 
 /* --- Animation Functions --- */
 
