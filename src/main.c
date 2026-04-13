@@ -43,7 +43,7 @@ SYS_INIT(peripheral_force_reset, PRE_KERNEL_1, 0);
 #define HEIGHT 16
 #define NUM_PIXELS (WIDTH * HEIGHT)
 
-#define SLEEP_MS_ACTIVE 220
+#define SLEEP_MS_ACTIVE 100
 #define FWD_R 32
 #define FWD_G 32
 #define FWD_B 32
@@ -128,23 +128,41 @@ static const struct bt_data sd[] = {
 	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
 		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
+/* BLE advertising interval unit = 0.625 ms
+ * 5000 ms / 0.625 = 8000 = 0x1F40
+ */
+static const struct bt_le_adv_param slow_adv_params =
+    BT_LE_ADV_PARAM_INIT(BT_LE_ADV_OPT_CONN,
+                         0x1F40,   /* min interval = 5000ms */
+                         0x1F40,   /* max interval = 5000ms */
+                         NULL);
 
 static void restart_adv_work_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(restart_adv_work, restart_adv_work_handler);
 
+static void switch_to_slow_adv(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    bt_le_adv_stop();
+    bt_le_adv_start(&slow_adv_params, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+}
+
+static K_WORK_DELAYABLE_DEFINE(slow_adv_work, switch_to_slow_adv);
+
 static void restart_adv_work_handler(struct k_work *work)
 {
-	int err;
+    int err;
+    ARG_UNUSED(work);
 
-	ARG_UNUSED(work);
+    (void)bt_le_adv_stop();
+    err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+    if (err == 0 || err == -EALREADY) {
+        /* start fast, schedule slowdown after 30s */
+        k_work_schedule(&slow_adv_work, K_SECONDS(30));
+        return;
+    }
 
-	(void)bt_le_adv_stop();
-	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-	if (err == 0 || err == -EALREADY) {
-		return;
-	}
-
-	(void)k_work_schedule(&restart_adv_work, K_MSEC(250));
+    (void)k_work_schedule(&restart_adv_work, K_MSEC(250));
 }
 
 static void on_disconnected(struct bt_conn *conn, uint8_t reason)
@@ -306,10 +324,14 @@ int main(void)
 	}
 
 	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
-			      sd, ARRAY_SIZE(sd));
+	sd, ARRAY_SIZE(sd));
+
 	if (err) {
 		return -1;
 	}
+
+	/* start fast, schedule slowdown after 30s */
+	k_work_schedule(&slow_adv_work, K_SECONDS(30));
 
 	while (1) {
 		if (!(ble_connected && leds_active)) {
