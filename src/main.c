@@ -11,6 +11,7 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <hal/nrf_i2s.h>
+#include "battery_monitor.h"
 
 /*
  * After a soft reset, peripheral PSEL registers can persist. The board's
@@ -307,6 +308,26 @@ void draw_right(uint32_t frame)
 	blit_right_arrow(origin_x, AMBER_R, AMBER_G, AMBER_B);
 }
 
+
+
+static void battery_check_work_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(battery_check_work, battery_check_work_handler);
+
+static void battery_check_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	int mv = battery_monitor_read_mv();
+	battery_monitor_update_leds(mv);
+	if (mv < 0) {
+		printk("Battery read failed: %d\n", mv);
+	} else {
+		printk("Battery: %d mV\n", mv);
+	}
+
+	(void)k_work_schedule(&battery_check_work, K_SECONDS(60));
+}
+
 /* --- Main Loop --- */
 
 int main(void)
@@ -314,10 +335,13 @@ int main(void)
 	int err;
 	uint32_t frame = 0;
 
+
+	/* Init LED strip */
 	if (!device_is_ready(strip)) {
 		return -1;
 	}
 
+	/* Initialize Bluetooth */
 	err = bt_enable(NULL);
 	if (err) {
 		return -1;
@@ -332,6 +356,13 @@ int main(void)
 
 	/* start fast, schedule slowdown after 30s */
 	k_work_schedule(&slow_adv_work, K_SECONDS(30));
+
+	/* Initialize battery monitor */
+	err = battery_monitor_init();
+	if (err) {
+		return -1;
+	}
+	(void)k_work_schedule(&battery_check_work, K_SECONDS(5));
 
 	while (1) {
 		if (!(ble_connected && leds_active)) {
