@@ -17,6 +17,7 @@
 #define AMBER_R 64
 #define AMBER_G 32
 #define AMBER_B 0
+#define LED_MATRIX_16X16_DRAW_CIRCLES
 
 static const struct device *const strip = DEVICE_DT_GET(STRIP_NODE);
 static struct led_rgb pixels[NUM_PIXELS];
@@ -41,6 +42,7 @@ static void plot(int x, int y, uint8_t r, uint8_t g, uint8_t b)
 	p->b = b;
 }
 
+#ifndef LED_MATRIX_16X16_DRAW_CIRCLES
 static int wrap_y(int y)
 {
 	y %= HEIGHT;
@@ -58,7 +60,9 @@ static int wrap_x(int x)
 	}
 	return x;
 }
+#endif /* !LED_MATRIX_16X16_DRAW_CIRCLES */
 
+#ifndef LED_MATRIX_16X16_DRAW_CIRCLES
 static void blit_up_arrow(int origin_y, uint8_t r, uint8_t g, uint8_t b)
 {
 	const int tip = origin_y;
@@ -112,29 +116,109 @@ static void blit_right_arrow(int origin_x, uint8_t r, uint8_t g, uint8_t b)
 		plot(wrap_x(tip - dx), 8, r, g, b);
 	}
 }
+#endif /* !LED_MATRIX_16X16_DRAW_CIRCLES */
+
+#ifdef LED_MATRIX_16X16_DRAW_CIRCLES
+static void blit_filled_circle(int cx, int cy, int radius, uint8_t r, uint8_t g, uint8_t b)
+{
+	const int r2 = radius * radius;
+
+	for (int y = 0; y < HEIGHT; y++) {
+		for (int x = 0; x < WIDTH; x++) {
+			const int dx = x - cx;
+			const int dy = y - cy;
+			if ((dx * dx + dy * dy) <= r2) {
+				plot(x, y, r, g, b);
+			}
+		}
+	}
+}
+
+static void blit_half_ring(int cx, int cy, int inner_radius, int outer_radius, bool right_half,
+			   uint8_t r, uint8_t g, uint8_t b)
+{
+	const int inner2 = inner_radius * inner_radius;
+	const int outer2 = outer_radius * outer_radius;
+
+	for (int y = 0; y < HEIGHT; y++) {
+		for (int x = 0; x < WIDTH; x++) {
+			if (right_half) {
+				if (x < cx) {
+					continue;
+				}
+			} else {
+				if (x > cx) {
+					continue;
+				}
+			}
+
+			const int dx = x - cx;
+			const int dy = y - cy;
+			const int d2 = (dx * dx + dy * dy);
+			if (d2 <= outer2 && d2 >= inner2) {
+				plot(x, y, r, g, b);
+			}
+		}
+	}
+}
+#endif /* LED_MATRIX_16X16_DRAW_CIRCLES */
 
 void led_matrix_16x16_draw_forward(uint32_t frame)
 {
+#ifdef LED_MATRIX_16X16_DRAW_CIRCLES
+	ARG_UNUSED(frame);
+	memset(pixels, 0, sizeof(pixels));
+
+	/* Center at (7,7) gives a nice symmetric circle on 16x16. */
+	blit_filled_circle(7, 7, 3, FWD_R, 0, 0);
+#else
 	memset(pixels, 0, sizeof(pixels));
 	int origin_y = -(int)(frame % HEIGHT);
 
 	blit_up_arrow(origin_y, FWD_R, FWD_G, FWD_B);
+#endif
 }
 
 void led_matrix_16x16_draw_left(uint32_t frame)
 {
+#ifdef LED_MATRIX_16X16_DRAW_CIRCLES
+	memset(pixels, 0, sizeof(pixels));
+
+	/* Base: constant red filled circle in the middle (radius 3). */
+	blit_filled_circle(7, 7, 3, FWD_R, 0, 0);
+
+	/* Overlay: blinking amber half ring around the red circle (left side). */
+	const bool blink_on = ((frame / 4U) % 2U) == 0U;
+	if (blink_on) {
+		blit_half_ring(7, 7, 4, 7, false, AMBER_R, AMBER_G, AMBER_B);
+	}
+#else
 	memset(pixels, 0, sizeof(pixels));
 	int origin_x = -(int)(frame % WIDTH);
 
 	blit_left_arrow(origin_x, AMBER_R, AMBER_G, AMBER_B);
+#endif
 }
 
 void led_matrix_16x16_draw_right(uint32_t frame)
 {
+#ifdef LED_MATRIX_16X16_DRAW_CIRCLES
+	memset(pixels, 0, sizeof(pixels));
+
+	/* Base: constant red filled circle in the middle (radius 3). */
+	blit_filled_circle(7, 7, 3, FWD_R, 0, 0);
+
+	/* Overlay: blinking amber half ring around the red circle (right side). */
+	const bool blink_on = ((frame / 4U) % 2U) == 0U;
+	if (blink_on) {
+		blit_half_ring(7, 7, 4, 7, true, AMBER_R, AMBER_G, AMBER_B);
+	}
+#else
 	memset(pixels, 0, sizeof(pixels));
 	int origin_x = (int)(frame % WIDTH);
 
 	blit_right_arrow(origin_x, AMBER_R, AMBER_G, AMBER_B);
+#endif
 }
 
 int led_matrix_16x16_init(void)

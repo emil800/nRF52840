@@ -4,6 +4,19 @@
 
 #define LED_MATRIX_16X16_FRAME_DELAY_MS 100
 
+/*
+ * Optional alternate draw mode:
+ * - Forward: filled red circle
+ * - Left/Right: filled red circle + blinking amber half circle on the side
+ *
+ * Enable by defining LED_MATRIX_16X16_DRAW_CIRCLES (e.g. via compiler flags).
+ */
+#ifdef LED_MATRIX_16X16_DRAW_CIRCLES
+#define LED_MATRIX_16X16_DRAW_MODE_NAME "circles"
+#else
+#define LED_MATRIX_16X16_DRAW_MODE_NAME "arrows"
+#endif
+
 /**
  * Initialize the 16x16 LED matrix (WS2812 strip via Zephyr led_strip).
  *
