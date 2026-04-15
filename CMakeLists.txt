@@ -6,4 +6,5 @@ target_sources(app PRIVATE
     src/main.c
     src/battery_monitor.c
     src/ble.c
+    src/led_matrix_16x16.c
 )
