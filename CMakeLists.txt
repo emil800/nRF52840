@@ -5,4 +5,5 @@ project(ws2812b_led_strip)
 target_sources(app PRIVATE
     src/main.c
     src/battery_monitor.c
+    src/ble.c
 )
